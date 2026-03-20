@@ -21,9 +21,27 @@ import argparse
 import traceback
 
 import torch
+import torch.distributed as dist
 
 from avatar_model_loader import AvatarModelLoader
 from avatar_generate import generate
+
+
+def broadcast_string(s, src=0):
+    """Broadcast a string from src rank to all other ranks."""
+    if dist.get_rank() == src:
+        data = s.encode('utf-8')
+        length = torch.tensor([len(data)], dtype=torch.long, device='cuda')
+    else:
+        length = torch.tensor([0], dtype=torch.long, device='cuda')
+    dist.broadcast(length, src=src)
+    n = length.item()
+    if dist.get_rank() == src:
+        tensor = torch.ByteTensor(list(data)).cuda()
+    else:
+        tensor = torch.zeros(n, dtype=torch.uint8, device='cuda')
+    dist.broadcast(tensor, src=src)
+    return tensor.cpu().numpy().tobytes().decode('utf-8')
 
 
 def main():
@@ -48,11 +66,28 @@ def main():
 
     is_main = (models.local_rank == 0)
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
+    while True:
+        # only rank 0 reads from stdin, then broadcasts to all ranks
+        line = ""
+        if is_main:
+            try:
+                line = sys.stdin.readline()
+            except EOFError:
+                line = ""
+            if not line:
+                line = "__EXIT__"
+            else:
+                line = line.strip()
+                if not line:
+                    line = "__SKIP__"
+                elif line.lower() in ('quit', 'exit'):
+                    line = "__EXIT__"
+
+        line = broadcast_string(line, src=0)
+
+        if line == "__SKIP__":
             continue
-        if line.lower() in ('quit', 'exit'):
+        if line == "__EXIT__":
             if is_main:
                 print("Shutting down.")
             break
